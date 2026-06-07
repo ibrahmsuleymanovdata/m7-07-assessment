@@ -1,0 +1,212 @@
+# Model Registry Specification — Scenario X: Personalized In-App Recommendations
+# MLflow-compatible schema. Each pipeline version bundles a retrieval model + ranker model.
+
+registry:
+  backend: mlflow
+  tracking_uri: "http://mlflow.mlops.svc.cluster.local:5000"
+  artifact_root: "s3://mlops-models/recommender"
+  database: "postgresql://mlflow:${MLFLOW_DB_PASSWORD}@rds-mlflow.internal:5432/mlflow"
+
+# ---------------------------------------------------------------------------
+# Pipeline version bundle
+# A pipeline_version ties one retrieval model version to one ranker model version.
+# Both must pass their individual gates before the bundle is promoted.
+# ---------------------------------------------------------------------------
+pipeline_versions:
+  - pipeline_version: "1.4.0"
+    stage: Champion                        # Staging | Challenger | Champion | Archived
+    created_at: "2026-06-02T08:14:00Z"
+    promoted_at: "2026-06-05T11:30:00Z"
+    promoted_by: "ali.mammadov@company.com"   # ML Engineer sign-off
+    product_sign_off: "leyla.hasanova@company.com"  # Product Lead (required for Champion)
+    ab_test_id: "exp-2026-05-22"
+    ab_winner: true
+    replaced_pipeline: "1.3.0"
+
+    retrieval_model:
+      name: "recommender-retrieval"
+      version: "14"
+      stage: Champion
+      artifact_uri: "s3://mlops-models/recommender/retrieval/v1.4.0/model.onnx"
+      framework: pytorch
+      export_format: onnx
+      size_mb: 420
+      serving_runtime: triton
+      serving_image: "recommender-service:a3f9d12-20260602"  # image tag at promotion time
+
+      lineage:
+        training_job_arn: "arn:aws:sagemaker:eu-west-1:123456789:training-job/retrieval-train-20260602"
+        training_data_uri: "s3://mlops-data/features/offline/dt=2026-05-03/dt=2026-06-01/"
+        training_data_freshness_days: 5
+        feature_pipeline_run_id: "spark-run-20260601-0400"
+        code_commit: "a3f9d12"
+        code_repo: "github.com/company/recommender"
+
+      offline_evaluation:
+        status: passed
+        evaluated_at: "2026-06-02T12:00:00Z"
+        evaluated_by: "automated"
+        metrics:
+          auc_roc: 0.847
+          recall_at_500: 0.783
+          p95_inference_ms: 36
+
+      shadow_evaluation:
+        status: passed
+        traffic_fraction: 0.10
+        duration_hours: 52
+        metrics:
+          p95_latency_ms: 104
+          error_rate_pct: 0.04
+          ctr_delta_vs_champion_pct: 1.2
+
+    ranker_model:
+      name: "recommender-ranker"
+      version: "9"
+      stage: Champion
+      artifact_uri: "s3://mlops-models/recommender/ranker/v1.4.0/model.onnx"
+      framework: xgboost
+      export_format: onnx
+      size_mb: 18
+      serving_runtime: triton
+      serving_image: "recommender-service:a3f9d12-20260602"
+
+      lineage:
+        training_job_arn: "arn:aws:sagemaker:eu-west-1:123456789:training-job/ranker-train-20260602"
+        training_data_uri: "s3://mlops-data/features/offline/dt=2026-05-03/dt=2026-06-01/"
+        training_data_freshness_days: 5
+        feature_pipeline_run_id: "spark-run-20260601-0400"
+        code_commit: "a3f9d12"
+        code_repo: "github.com/company/recommender"
+
+      offline_evaluation:
+        status: passed
+        evaluated_at: "2026-06-02T12:30:00Z"
+        evaluated_by: "automated"
+        metrics:
+          ndcg_at_20: 0.423
+          p95_inference_ms: 17
+
+      shadow_evaluation:
+        status: passed
+        traffic_fraction: 0.10
+        duration_hours: 52
+        metrics:
+          p95_latency_ms: 104   # end-to-end, same shadow run as retrieval
+          error_rate_pct: 0.04
+
+  - pipeline_version: "1.3.0"
+    stage: Archived
+    archived_at: "2026-06-05T11:31:00Z"
+    archived_by: "automated"
+    replaced_by_version: "1.4.0"
+    artifact_retention_until: "2026-09-05"   # 90 days from archive date
+    retrieval_model:
+      name: "recommender-retrieval"
+      version: "13"
+      artifact_uri: "s3://mlops-models/recommender/retrieval/v1.3.0/model.onnx"
+    ranker_model:
+      name: "recommender-ranker"
+      version: "8"
+      artifact_uri: "s3://mlops-models/recommender/ranker/v1.3.0/model.onnx"
+
+  - pipeline_version: "1.5.0-challenger"
+    stage: Challenger
+    created_at: "2026-06-06T09:00:00Z"
+    promoted_by: "ali.mammadov@company.com"
+    ab_test_id: "exp-2026-06-06"
+    ab_split_ratio: "50:50"               # Champion vs Challenger traffic split
+    ab_minimum_duration_days: 14
+    ab_primary_metric: "add_to_cart_rate"
+
+    retrieval_model:
+      name: "recommender-retrieval"
+      version: "15"
+      stage: Challenger
+      artifact_uri: "s3://mlops-models/recommender/retrieval/v1.5.0/model.onnx"
+      size_mb: 435
+
+      offline_evaluation:
+        status: passed
+        metrics:
+          auc_roc: 0.861
+          recall_at_500: 0.798
+          p95_inference_ms: 38
+
+      shadow_evaluation:
+        status: passed
+        traffic_fraction: 0.10
+        duration_hours: 48
+        metrics:
+          p95_latency_ms: 107
+          error_rate_pct: 0.03
+          ctr_delta_vs_champion_pct: 2.1
+
+    ranker_model:
+      name: "recommender-ranker"
+      version: "9"                         # same ranker as Champion — only retrieval changed
+      stage: Champion
+      artifact_uri: "s3://mlops-models/recommender/ranker/v1.4.0/model.onnx"
+
+# ---------------------------------------------------------------------------
+# Promotion gates (enforced by CI/CD pipeline before stage transition)
+# ---------------------------------------------------------------------------
+promotion_gates:
+  staging_to_challenger:
+    automated:
+      - metric: retrieval.auc_roc
+        operator: ">="
+        threshold: 0.82
+      - metric: retrieval.recall_at_500
+        operator: ">="
+        threshold: 0.75
+      - metric: ranker.ndcg_at_20
+        operator: ">="
+        threshold: 0.41
+      - metric: retrieval.p95_inference_ms
+        operator: "<="
+        threshold: 40
+      - metric: ranker.p95_inference_ms
+        operator: "<="
+        threshold: 20
+      - metric: training_data_freshness_days
+        operator: "<="
+        threshold: 7
+    human:
+      - role: ml_engineer
+        required: true
+        action: "approve staging promotion in GitHub Actions"
+
+  challenger_to_champion:
+    shadow_gates:
+      - metric: end_to_end.p95_latency_ms
+        operator: "<="
+        threshold: 110
+      - metric: end_to_end.error_rate_pct
+        operator: "<"
+        threshold: 0.1
+      - metric: ctr_delta_vs_champion_pct
+        operator: ">="
+        threshold: -5.0           # must not be worse than 5% below Champion
+      shadow_minimum_hours: 48
+      shadow_traffic_fraction: 0.10
+    ab_gates:
+      minimum_duration_days: 14
+      required_statistical_power: 0.80
+      primary_metric: add_to_cart_rate
+      minimum_lift_pct: 0.0       # any improvement or parity acceptable
+    human:
+      - role: ml_engineer
+        required: true
+      - role: product_lead
+        required: true
+        action: "approve Champion promotion in GitHub Actions"
+
+# ---------------------------------------------------------------------------
+# Retention policy
+# ---------------------------------------------------------------------------
+retention:
+  archived_weights_days: 90
+  mlflow_metadata: permanent
+  training_logs_days: 365
+  evaluation_reports_days: 365

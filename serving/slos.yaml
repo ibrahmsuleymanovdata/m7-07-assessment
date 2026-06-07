@@ -1,0 +1,145 @@
+# SLO Definitions — Scenario X: Personalized In-App Recommendations
+# These SLOs are referenced by monitoring/alerts.yaml (burn-rate windows)
+# and validated against capacity-plan.md (latency budget breakdown).
+
+service: recommender-service
+scenario: scenario-x-retail-recommendations
+version: "1.0"
+last_updated: "2026-06-07"
+
+# ---------------------------------------------------------------------------
+# SLO-1: End-to-End Availability
+# ---------------------------------------------------------------------------
+- id: SLO-1
+  name: Recommendation API Availability
+  description: >
+    The /v1/recommend endpoint returns a 2xx response (including cold-start
+    fallback responses) for at least 99.9% of requests measured over a
+    rolling 30-day window.
+  sli:
+    type: availability
+    good_event: "HTTP response code in [200, 201] on POST /v1/recommend"
+    bad_event: "HTTP response code 5xx or connection timeout"
+    metric: |
+      sum(rate(recommender_requests_total{status=~"2xx"}[5m]))
+      /
+      sum(rate(recommender_requests_total[5m]))
+  target: 0.999          # 99.9% — allows ~43 min downtime/month
+  error_budget_minutes: 43.2   # 30 days × 60 min × 0.001
+  window: 30d
+  notes: >
+    Cold-start responses (cold_start: true) count as successful. Only
+    model server failures or gateway errors count against this SLO.
+
+# ---------------------------------------------------------------------------
+# SLO-2: End-to-End Latency (p95)
+# ---------------------------------------------------------------------------
+- id: SLO-2
+  name: p95 End-to-End Latency
+  description: >
+    95% of POST /v1/recommend requests complete within 120 ms end-to-end,
+    measured at the API Gateway (includes all downstream segments).
+    See capacity-plan.md for the 110 ms budget breakdown with 10 ms headroom.
+  sli:
+    type: latency
+    threshold_ms: 120
+    metric: |
+      histogram_quantile(0.95,
+        sum(rate(recommender_request_duration_seconds_bucket[5m])) by (le)
+      ) * 1000
+  target: 0.95
+  window: 30d
+  notes: >
+    Latency budget: 15 ms network + 5 ms gateway + 10 ms Redis + 5 ms gRPC
+    + 40 ms retrieval + 20 ms ranker + 15 ms response = 110 ms.
+    10 ms headroom before SLO breach.
+
+# ---------------------------------------------------------------------------
+# SLO-3: Model Freshness
+# ---------------------------------------------------------------------------
+- id: SLO-3
+  name: Model Version Staleness
+  description: >
+    The X-Model-Version response header must reflect a model version
+    registered in MLflow within the last 30 days. Stale or missing model
+    version headers indicate serving infrastructure has drifted from the
+    registry and count as a violation.
+  sli:
+    type: correctness
+    good_event: >
+      X-Model-Version header present AND model version registered in
+      MLflow registry within the past 30 days
+    metric: |
+      sum(rate(recommender_requests_total{model_version_valid="true"}[5m]))
+      /
+      sum(rate(recommender_requests_total[5m]))
+  target: 0.999
+  window: 30d
+  notes: >
+    Prometheus label model_version is populated from the X-Model-Version
+    header by the Prometheus scrape config. See monitoring/alerts.yaml —
+    alert ModelVersionMismatch fires when this ratio drops below 0.999.
+    X-Model-Version is set by the Recommendation Service from the active
+    MLflow registry tag (see architecture/architecture.md).
+
+# ---------------------------------------------------------------------------
+# SLO-4: Feature Freshness
+# ---------------------------------------------------------------------------
+- id: SLO-4
+  name: Redis Feature Staleness
+  description: >
+    User feature vectors in Redis must be no older than 8 hours at the
+    time of serving. The Spark pipeline refreshes every 4 hours; this SLO
+    allows one missed run before breaching. Staleness is measured by the
+    feature_vector_age_seconds metric exported by the Feature API.
+  sli:
+    type: freshness
+    threshold_hours: 8
+    metric: |
+      histogram_quantile(0.99,
+        sum(rate(feature_vector_age_seconds_bucket[5m])) by (le)
+      ) / 3600
+  target: 0.99
+  window: 30d
+  notes: >
+    TTL in Redis is 12 h (3× the 4 h refresh interval). This SLO fires
+    before TTL expiry, giving the on-call 4 h to fix the Spark pipeline
+    before users experience cold-start fallback at scale.
+
+# ---------------------------------------------------------------------------
+# SLO-5: Cold-Start Rate (Quality Signal)
+# ---------------------------------------------------------------------------
+- id: SLO-5
+  name: Cold-Start Fallback Rate
+  description: >
+    No more than 10% of requests should be served via the cold-start
+    DynamoDB fallback path. A spike above this threshold indicates either
+    a Redis failure or an unusually high proportion of new users and should
+    trigger investigation.
+  sli:
+    type: quality
+    metric: |
+      sum(rate(recommender_requests_total{cold_start="true"}[5m]))
+      /
+      sum(rate(recommender_requests_total[5m]))
+  target: 0.90   # cold_start rate must stay below 10%
+  window: 7d     # shorter window — quality signal, not hard reliability SLO
+  notes: >
+    This SLO does not consume error budget in the same pool as SLO-1.
+    It is a leading indicator: a cold-start spike often precedes an
+    availability event if Redis is degraded.
+
+# ---------------------------------------------------------------------------
+# Error Budget Policy
+# ---------------------------------------------------------------------------
+error_budget_policy:
+  burn_rate_alerts: see monitoring/alerts.yaml
+  freeze_window: >
+    When SLO-1 or SLO-2 error budget is more than 50% consumed in the
+    current 30-day window, no new model versions may be promoted to
+    Champion without explicit approval from the ML Engineer and
+    Platform Engineer on-call.
+  exhausted_budget_action: >
+    If error budget for SLO-1 is fully exhausted, the team must pause
+    all non-critical deployments and conduct a postmortem before resuming
+    Champion promotion. Rollback procedure: see runbooks/rollback.md.
