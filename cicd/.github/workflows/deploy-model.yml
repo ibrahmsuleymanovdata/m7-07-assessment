@@ -46,7 +46,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  AWS_REGION: eu-east-1
+  AWS_REGION: us-east-1
   ECR_REGISTRY: 123456789.dkr.ecr.us-east-1.amazonaws.com
   ECR_REPOSITORY: recommender-service
   EKS_CLUSTER: mlops-prod
@@ -244,28 +244,34 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install k6
-        run: |
-          curl https://github.com/grafana/k6/releases/download/v0.50.0/k6-v0.50.0-linux-amd64.tar.gz \
-            -L -o k6.tar.gz
-          tar -xzf k6.tar.gz
-          sudo mv k6-v0.50.0-linux-amd64/k6 /usr/local/bin/
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
 
-      - name: Run steady-state load test (800 RPS, 10 min)
+      - name: Install Locust
+        run: pip install locust
+
+      - name: Run steady-state load test (800 RPS, 15 min)
+        # Scenario 2 — Peak Load from serving/load-test-plan.md
         env:
           LOAD_TEST_TOKEN: ${{ secrets.LOAD_TEST_TOKEN }}
         run: |
-          k6 run \
-            --env BASE_URL=https://api-staging.company.com \
-            --env LOAD_TEST_TOKEN=${{ env.LOAD_TEST_TOKEN }} \
-            --out json=load-test-results.json \
-            serving/load-test-plan.js
+          locust -f tests/load/locustfile.py \
+            --host https://api-staging.company.com \
+            --users 200 --spawn-rate 40 --run-time 15m \
+            --headless --only-summary \
+            --csv results/load_test
+
+      - name: Assert pass criteria (p95 ≤ 120 ms, error rate < 0.1%)
+        run: python tests/load/assert_results.py results/load_test_stats.csv
 
       - name: Upload load test results
         uses: actions/upload-artifact@v4
         with:
           name: load-test-results
-          path: load-test-results.json
+          path: results/
 
   # ---------------------------------------------------------------------------
   # JOB 5 — Deploy to Production
@@ -349,9 +355,9 @@ jobs:
         run: |
           # Query Prometheus for canary error rate and p95 latency
           ERROR_RATE=$(python scripts/prometheus_query.py \
-            --query 'sum(rate(http_requests_total{service="recommender-api",deployment="canary",status=~"5.."}[5m])) / sum(rate(http_requests_total{service="recommender-api",deployment="canary"}[5m]))')
+            --query 'sum(rate(recommender_requests_total{service="recommender-api",deployment="canary",status=~"5.."}[5m])) / sum(rate(recommender_requests_total{service="recommender-api",deployment="canary"}[5m]))')
           P95_MS=$(python scripts/prometheus_query.py \
-            --query 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service="recommender-api",deployment="canary"}[5m])) by (le)) * 1000')
+            --query 'histogram_quantile(0.95, sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api",deployment="canary"}[5m])) by (le)) * 1000')
 
           echo "Canary error rate: ${ERROR_RATE}"
           echo "Canary p95 latency: ${P95_MS} ms"

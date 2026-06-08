@@ -30,15 +30,15 @@ spec:
         - alert: RecommenderAvailabilityCritical
           expr: |
             (
-              sum(rate(http_requests_total{service="recommender-api", status=~"5.."}[1h]))
+              sum(rate(recommender_requests_total{service="recommender-api", status=~"5.."}[1h]))
               /
-              sum(rate(http_requests_total{service="recommender-api"}[1h]))
+              sum(rate(recommender_requests_total{service="recommender-api"}[1h]))
             ) > (14.4 * (1 - 0.999))
             and
             (
-              sum(rate(http_requests_total{service="recommender-api", status=~"5.."}[5m]))
+              sum(rate(recommender_requests_total{service="recommender-api", status=~"5.."}[5m]))
               /
-              sum(rate(http_requests_total{service="recommender-api"}[5m]))
+              sum(rate(recommender_requests_total{service="recommender-api"}[5m]))
             ) > (14.4 * (1 - 0.999))
           for: 2m
           labels:
@@ -59,15 +59,15 @@ spec:
         - alert: RecommenderAvailabilityWarning
           expr: |
             (
-              sum(rate(http_requests_total{service="recommender-api", status=~"5.."}[6h]))
+              sum(rate(recommender_requests_total{service="recommender-api", status=~"5.."}[6h]))
               /
-              sum(rate(http_requests_total{service="recommender-api"}[6h]))
+              sum(rate(recommender_requests_total{service="recommender-api"}[6h]))
             ) > (6.0 * (1 - 0.999))
             and
             (
-              sum(rate(http_requests_total{service="recommender-api", status=~"5.."}[30m]))
+              sum(rate(recommender_requests_total{service="recommender-api", status=~"5.."}[30m]))
               /
-              sum(rate(http_requests_total{service="recommender-api"}[30m]))
+              sum(rate(recommender_requests_total{service="recommender-api"}[30m]))
             ) > (6.0 * (1 - 0.999))
           for: 15m
           labels:
@@ -92,17 +92,17 @@ spec:
           expr: |
             (
               1 - (
-                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[1h]))
+                sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[1h]))
                 /
-                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[1h]))
+                sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[1h]))
               )
             ) > (14.4 * (1 - 0.95))
             and
             (
               1 - (
-                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[5m]))
+                sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[5m]))
                 /
-                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[5m]))
+                sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[5m]))
               )
             ) > (14.4 * (1 - 0.95))
           for: 2m
@@ -124,17 +124,17 @@ spec:
           expr: |
             (
               1 - (
-                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[6h]))
+                sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[6h]))
                 /
-                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[6h]))
+                sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[6h]))
               )
             ) > (6.0 * (1 - 0.95))
             and
             (
               1 - (
-                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[30m]))
+                sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[30m]))
                 /
-                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[30m]))
+                sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[30m]))
               )
             ) > (6.0 * (1 - 0.95))
           for: 15m
@@ -153,7 +153,7 @@ spec:
         - alert: RecommenderLatencyHardBreach
           expr: |
             histogram_quantile(0.95,
-              sum(rate(http_request_duration_seconds_bucket{service="recommender-api"}[5m])) by (le)
+              sum(rate(recommender_request_duration_seconds_bucket{service="recommender-api"}[5m])) by (le)
             ) > 0.15
           for: 5m
           labels:
@@ -180,7 +180,7 @@ spec:
           expr: |
             count(
               count by (model_version) (
-                http_requests_total{service="recommender-api", model_version!~"1\\.4\\.0|1\\.5\\.0-challenger|fallback-popularity-v1"}
+                recommender_requests_total{service="recommender-api", model_version!~"1\\.4\\.0|1\\.5\\.0-challenger|fallback-popularity-v1"}
               )
             ) > 0
           for: 5m
@@ -199,7 +199,7 @@ spec:
 
         - alert: RecommenderModelVersionAbsent
           expr: |
-            sum(rate(http_requests_total{service="recommender-api", model_version=""}[5m])) > 1
+            sum(rate(recommender_requests_total{service="recommender-api", model_version=""}[5m])) > 1
           for: 3m
           labels:
             severity: warning
@@ -221,10 +221,10 @@ spec:
         - alert: RecommenderColdStartRateHigh
           expr: |
             (
-              sum(rate(cold_start_requests_total{service="recommender-api"}[5m]))
+              sum(rate(recommender_requests_total{service="recommender-api", cold_start="true"}[5m]))
               /
-              sum(rate(http_requests_total{service="recommender-api"}[5m]))
-            ) > 0.20
+              sum(rate(recommender_requests_total{service="recommender-api"}[5m]))
+            ) > 0.10   # matches SLO-5 threshold in serving/slos.yaml
           for: 10m
           labels:
             severity: warning

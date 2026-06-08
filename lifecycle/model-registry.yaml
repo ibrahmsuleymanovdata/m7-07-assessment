@@ -35,7 +35,7 @@ pipeline_versions:
       serving_image: "recommender-service:a3f9d12-20260602"  # image tag at promotion time
 
       lineage:
-        training_job_arn: "arn:aws:sagemaker:eu-west-1:123456789:training-job/retrieval-train-20260602"
+        training_job_arn: "arn:aws:sagemaker:us-east-1:123456789:training-job/retrieval-train-20260602"
         training_data_uri: "s3://mlops-data/features/offline/dt=2026-05-03/dt=2026-06-01/"
         training_data_freshness_days: 5
         feature_pipeline_run_id: "spark-run-20260601-0400"
@@ -72,7 +72,7 @@ pipeline_versions:
       serving_image: "recommender-service:a3f9d12-20260602"
 
       lineage:
-        training_job_arn: "arn:aws:sagemaker:eu-west-1:123456789:training-job/ranker-train-20260602"
+        training_job_arn: "arn:aws:sagemaker:us-east-1:123456789:training-job/ranker-train-20260602"
         training_data_uri: "s3://mlops-data/features/offline/dt=2026-05-03/dt=2026-06-01/"
         training_data_freshness_days: 5
         feature_pipeline_run_id: "spark-run-20260601-0400"

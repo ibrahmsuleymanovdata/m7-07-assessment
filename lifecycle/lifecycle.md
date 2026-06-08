@@ -175,7 +175,7 @@ Image tag is unchanged unless serving code was also modified. Model swap ≠ ima
 | Model version mismatch | Prometheus (`X-Model-Version` label) | Multiple versions serving unexpectedly |
 | Feature drift (PSI) | Offline drift job, runs daily | PSI > 0.15 on user embedding distribution |
 | CTR decay | Offline metrics job, runs daily | CTR drops > 15% vs. 7-day rolling average |
-| Cold-start rate | Prometheus | > 20% of requests are cold-start |
+| Cold-start rate | Prometheus | > 10% of requests are cold-start (matches SLO-5 and monitoring/alerts.yaml) |
 
 Full alert definitions: see `monitoring/alerts.yaml`.
 
