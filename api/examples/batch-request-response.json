@@ -1,0 +1,58 @@
+// --- BATCH REQUEST ---
+// POST /v1/recommend/batch
+
+{
+  "requests": [
+    {
+      "user_id": "usr_01HZ3K8P2NQW4V6RYJCTXB5A",
+      "context": { "platform": "web", "screen": "home" },
+      "max_results": 10
+    },
+    {
+      "user_id": "usr_01HZ3K9ABCDE1F2G3H4I5J6K",
+      "context": { "platform": "android", "screen": "home" },
+      "max_results": 10
+    }
+  ],
+  "callback_url": "https://internal.company.com/webhooks/recommendations",
+  "priority": "normal"
+}
+
+// --- BATCH ACCEPTED RESPONSE (202) ---
+
+{
+  "job_id": "job_01HZ3KCFP8R5V2XQNM9WDBTJ",
+  "status": "queued",
+  "estimated_completion_seconds": 30,
+  "poll_url": "/v1/recommend/batch/job_01HZ3KCFP8R5V2XQNM9WDBTJ"
+}
+
+// --- BATCH RESULT (GET /v1/recommend/batch/{job_id}) ---
+
+{
+  "job_id": "job_01HZ3KCFP8R5V2XQNM9WDBTJ",
+  "status": "completed",
+  "failed_count": 0,
+  "completed_at": "2026-06-07T14:32:10Z",
+  "results": [
+    {
+      "request_id": "req_batch_0001",
+      "cold_start": false,
+      "model_pipeline_version": "1.4.0",
+      "ab_cohort": null,
+      "recommendations": [
+        { "item_id": "item_00789", "score": 0.91, "rank": 1, "category_id": "cat_electronics" },
+        { "item_id": "item_01234", "score": 0.87, "rank": 2, "category_id": "cat_accessories" }
+      ]
+    },
+    {
+      "request_id": "req_batch_0002",
+      "cold_start": true,
+      "model_pipeline_version": "cold-start",
+      "ab_cohort": null,
+      "recommendations": [
+        { "item_id": "item_09901", "score": 0.99, "rank": 1, "category_id": "cat_trending" }
+      ]
+    }
+  ]
+}

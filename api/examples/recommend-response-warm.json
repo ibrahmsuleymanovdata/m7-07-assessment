@@ -1,0 +1,17 @@
+{
+  "request_id": "req_01HZ3KBVQ2M7X9WNPD4YFCGE",
+  "cold_start": false,
+  "model_pipeline_version": "1.4.0",
+  "ab_cohort": null,
+  "recommendations": [
+    { "item_id": "item_00789", "score": 0.91, "rank": 1, "category_id": "cat_electronics" },
+    { "item_id": "item_01234", "score": 0.87, "rank": 2, "category_id": "cat_accessories" },
+    { "item_id": "item_03345", "score": 0.83, "rank": 3, "category_id": "cat_electronics" },
+    { "item_id": "item_04456", "score": 0.79, "rank": 4, "category_id": "cat_clothing" },
+    { "item_id": "item_05567", "score": 0.76, "rank": 5, "category_id": "cat_electronics" }
+  ]
+}
+
+// Response headers:
+// X-Model-Version: 1.4.0
+// X-Request-ID: req_01HZ3KBVQ2M7X9WNPD4YFCGE

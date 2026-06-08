@@ -1,0 +1,337 @@
+# Alerting Rules — Scenario X: Personalized In-App Recommendations
+# Prometheus Alertmanager format (PrometheusRule CRD for Kubernetes)
+#
+# All thresholds must match:
+#   - serving/slos.yaml       (burn-rate windows and objectives)
+#   - runbooks/rollback.md    (trigger thresholds for rollback)
+#   - api/openapi.yaml        (X-Model-Version header definition)
+# =============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: recommender-alerts
+  namespace: mlops
+  labels:
+    app: recommender
+    role: alert-rules
+
+spec:
+  groups:
+
+    # =========================================================================
+    # GROUP 1 — Availability (SLO: 99.9%)
+    # =========================================================================
+    - name: recommender.availability
+      rules:
+
+        # Multi-window burn-rate alert — Critical
+        # Consuming error budget at 14.4× rate → 2% of monthly budget in 1h
+        - alert: RecommenderAvailabilityCritical
+          expr: |
+            (
+              sum(rate(http_requests_total{service="recommender-api", status=~"5.."}[1h]))
+              /
+              sum(rate(http_requests_total{service="recommender-api"}[1h]))
+            ) > (14.4 * (1 - 0.999))
+            and
+            (
+              sum(rate(http_requests_total{service="recommender-api", status=~"5.."}[5m]))
+              /
+              sum(rate(http_requests_total{service="recommender-api"}[5m]))
+            ) > (14.4 * (1 - 0.999))
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            slo: availability
+          annotations:
+            summary: "Recommender API availability SLO burning fast (critical)"
+            description: >
+              Error rate is consuming the 99.9% availability error budget at
+              14.4× the allowed rate over both 1h and 5m windows.
+              Current 1h error rate: {{ $value | humanizePercentage }}.
+            runbook: "runbooks/rollback.md"
+            dashboard: "https://grafana.internal/d/recommender-slos"
+
+        # Multi-window burn-rate alert — Warning
+        # Consuming error budget at 6× rate → 5% of monthly budget in 6h
+        - alert: RecommenderAvailabilityWarning
+          expr: |
+            (
+              sum(rate(http_requests_total{service="recommender-api", status=~"5.."}[6h]))
+              /
+              sum(rate(http_requests_total{service="recommender-api"}[6h]))
+            ) > (6.0 * (1 - 0.999))
+            and
+            (
+              sum(rate(http_requests_total{service="recommender-api", status=~"5.."}[30m]))
+              /
+              sum(rate(http_requests_total{service="recommender-api"}[30m]))
+            ) > (6.0 * (1 - 0.999))
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            slo: availability
+          annotations:
+            summary: "Recommender API availability SLO burning (warning)"
+            description: >
+              Error rate is consuming the 99.9% availability error budget at
+              6× the allowed rate over both 6h and 30m windows.
+            runbook: "runbooks/rollback.md"
+
+    # =========================================================================
+    # GROUP 2 — Latency p95 (SLO: 95% of requests ≤ 120 ms)
+    # =========================================================================
+    - name: recommender.latency
+      rules:
+
+        # Multi-window burn-rate — Critical
+        - alert: RecommenderLatencyCritical
+          expr: |
+            (
+              1 - (
+                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[1h]))
+                /
+                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[1h]))
+              )
+            ) > (14.4 * (1 - 0.95))
+            and
+            (
+              1 - (
+                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[5m]))
+                /
+                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[5m]))
+              )
+            ) > (14.4 * (1 - 0.95))
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+            slo: latency_p95
+          annotations:
+            summary: "Recommender p95 latency SLO burning fast (critical)"
+            description: >
+              More than 5% of requests are exceeding the 120 ms p95 latency budget,
+              consuming the error budget at 14.4× over both 1h and 5m windows.
+              Check Triton GPU utilisation and Redis read latency.
+            runbook: "runbooks/rollback.md"
+            dashboard: "https://grafana.internal/d/recommender-slos"
+
+        # Multi-window burn-rate — Warning
+        - alert: RecommenderLatencyWarning
+          expr: |
+            (
+              1 - (
+                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[6h]))
+                /
+                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[6h]))
+              )
+            ) > (6.0 * (1 - 0.95))
+            and
+            (
+              1 - (
+                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="0.12"}[30m]))
+                /
+                sum(rate(http_request_duration_seconds_bucket{service="recommender-api", le="+Inf"}[30m]))
+              )
+            ) > (6.0 * (1 - 0.95))
+          for: 15m
+          labels:
+            severity: warning
+            team: platform
+            slo: latency_p95
+          annotations:
+            summary: "Recommender p95 latency SLO burning (warning)"
+            description: >
+              Latency budget consumption elevated over 6h and 30m windows.
+              Investigate feature store latency and model inference times.
+            runbook: "runbooks/rollback.md"
+
+        # Hard latency threshold — immediate action
+        - alert: RecommenderLatencyHardBreach
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(http_request_duration_seconds_bucket{service="recommender-api"}[5m])) by (le)
+            ) > 0.15
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Recommender p95 latency above 150 ms for 5 minutes"
+            description: >
+              p95 latency has exceeded 150 ms (25% above SLO budget) for 5 consecutive minutes.
+              Immediate investigation required. Consider rollback if model version recently changed.
+              Current p95: {{ $value | humanizeDuration }}.
+            runbook: "runbooks/rollback.md"
+
+    # =========================================================================
+    # GROUP 3 — Model Version Mismatch
+    # Detects unexpected model versions serving traffic.
+    # X-Model-Version header is set by Recommendation Service (not API Gateway).
+    # See: api/openapi.yaml — X-Model-Version header definition.
+    # =========================================================================
+    - name: recommender.model_version
+      rules:
+
+        - alert: RecommenderUnexpectedModelVersion
+          expr: |
+            count(
+              count by (model_version) (
+                http_requests_total{service="recommender-api", model_version!~"1\\.4\\.0|1\\.5\\.0-challenger|fallback-popularity-v1"}
+              )
+            ) > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Unexpected model version serving traffic"
+            description: >
+              A model version other than the registered Champion (1.4.0),
+              Challenger (1.5.0-challenger), or fallback (fallback-popularity-v1)
+              has been observed in the X-Model-Version response header for 5 minutes.
+              Unexpected version: {{ $labels.model_version }}.
+              Verify MLflow registry and Kubernetes deployment config.
+            runbook: "runbooks/rollback.md"
+
+        - alert: RecommenderModelVersionAbsent
+          expr: |
+            sum(rate(http_requests_total{service="recommender-api", model_version=""}[5m])) > 1
+          for: 3m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "X-Model-Version header missing from responses"
+            description: >
+              Requests are being served without an X-Model-Version header.
+              The Recommendation Service may have failed to read MODEL_VERSION
+              from its environment. Check pod environment variables.
+            runbook: "runbooks/rollback.md"
+
+    # =========================================================================
+    # GROUP 4 — Cold-Start Rate (SLO: ≤ 20% of requests)
+    # =========================================================================
+    - name: recommender.cold_start
+      rules:
+
+        - alert: RecommenderColdStartRateHigh
+          expr: |
+            (
+              sum(rate(cold_start_requests_total{service="recommender-api"}[5m]))
+              /
+              sum(rate(http_requests_total{service="recommender-api"}[5m]))
+            ) > 0.20
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+            slo: cold_start_rate
+          annotations:
+            summary: "Cold-start fallback rate above 20%"
+            description: >
+              More than 20% of recommendation requests are being served by the
+              DynamoDB cold-start fallback rather than the ML model.
+              This may indicate Redis cache degradation or a delayed Spark pipeline.
+              Current cold-start rate: {{ $value | humanizePercentage }}.
+              Check Redis cluster health and last Spark pipeline run time.
+            runbook: "runbooks/rollback.md"
+
+    # =========================================================================
+    # GROUP 5 — Feature Drift
+    # =========================================================================
+    - name: recommender.drift
+      rules:
+
+        - alert: RecommenderFeatureDriftWarning
+          expr: |
+            recommender_feature_psi{feature="user_embedding"} > 0.15
+          for: 0m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "User embedding distribution drift detected (PSI > 0.15)"
+            description: >
+              The Population Stability Index for user embedding features has exceeded
+              0.15, indicating meaningful distribution shift from training data.
+              Current PSI: {{ $value }}.
+              Consider triggering a model retraining run.
+            runbook: "runbooks/rollback.md"
+
+        - alert: RecommenderFeatureDriftCritical
+          expr: |
+            recommender_feature_psi{feature="user_embedding"} > 0.25
+          for: 0m
+          labels:
+            severity: critical
+            team: ml-platform
+          annotations:
+            summary: "Severe user embedding distribution drift (PSI > 0.25)"
+            description: >
+              PSI has exceeded 0.25 — severe distribution shift.
+              Model predictions may be significantly degraded.
+              Current PSI: {{ $value }}.
+              Trigger retraining immediately and review recent data pipeline changes.
+            runbook: "runbooks/rollback.md"
+
+        - alert: RecommenderCTRDecay
+          expr: |
+            (
+              recommender_ctr_1d
+              /
+              avg_over_time(recommender_ctr_1d[7d])
+            ) < 0.85
+          for: 0m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "CTR dropped > 15% vs 7-day rolling average"
+            description: >
+              Click-through rate has fallen more than 15% below the 7-day rolling
+              average. This may indicate model degradation or a product/catalogue change.
+              Current CTR ratio vs average: {{ $value | humanizePercentage }}.
+              Investigate model performance and recent catalogue updates.
+            runbook: "runbooks/rollback.md"
+
+    # =========================================================================
+    # GROUP 6 — Feature Store Health
+    # =========================================================================
+    - name: recommender.feature_store
+      rules:
+
+        - alert: RecommenderRedisLatencyHigh
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(redis_command_duration_seconds_bucket{service="feature-api"}[5m])) by (le)
+            ) > 0.005
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Redis p99 read latency above 5 ms"
+            description: >
+              Feature store Redis p99 read latency has exceeded 5 ms for 5 minutes.
+              This will push end-to-end p95 latency toward the 120 ms SLO limit.
+              Current Redis p99: {{ $value | humanizeDuration }}.
+
+        - alert: RecommenderFeaturePipelineStale
+          expr: |
+            (time() - recommender_feature_pipeline_last_success_timestamp) > 28800
+          for: 0m
+          labels:
+            severity: warning
+            team: ml-platform
+          annotations:
+            summary: "Feature pipeline has not run successfully in 8 hours"
+            description: >
+              The Spark feature pipeline last succeeded more than 8 hours ago
+              (SLO threshold: 8h; TTL: 12h).
+              Redis keys will expire in approximately {{ 43200 - (time() - recommender_feature_pipeline_last_success_timestamp) | humanizeDuration }}.
+              Investigate EMR Serverless job status.
+            runbook: "runbooks/rollback.md"

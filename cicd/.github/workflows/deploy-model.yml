@@ -1,0 +1,404 @@
+# =============================================================================
+# deploy-model.yml — CI/CD Pipeline: Model Promotion & Service Deployment
+# Scenario X: Personalized In-App Recommendations
+#
+# Triggers:
+#   1. Push to main (serving code change) → build new image + deploy
+#   2. Manual workflow_dispatch (model promotion) → deploy existing image
+#      with updated MODEL_S3_PATH (no image rebuild needed — see ADR-0002)
+#
+# Image tag scheme: recommender-service:{git-sha7}-{YYYYMMDD}
+# Matches: lifecycle/model-registry.yaml (serving_image field)
+#          container/README.md (Image Tag Scheme section)
+#          architecture/architecture.md (Recommendation Service description)
+# =============================================================================
+
+name: Deploy Recommender Model
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "requirements.txt"
+      - "container/Dockerfile"
+
+  workflow_dispatch:
+    inputs:
+      pipeline_version:
+        description: "MLflow pipeline version to deploy (e.g. 1.5.0-challenger)"
+        required: true
+        type: string
+      target_stage:
+        description: "Registry stage being deployed"
+        required: true
+        type: choice
+        options: [Challenger, Champion]
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [staging, production]
+
+# Prevent concurrent deployments to the same environment
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-east-1
+  ECR_REGISTRY: 123456789.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: recommender-service
+  EKS_CLUSTER: mlops-prod
+  MLFLOW_TRACKING_URI: ${{ secrets.MLFLOW_TRACKING_URI }}
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # JOB 1 — Lint & Test (always runs)
+  # ---------------------------------------------------------------------------
+  lint-and-test:
+    name: Lint & Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest ruff mypy
+
+      - name: Lint (ruff)
+        run: ruff check src/
+
+      - name: Type check (mypy)
+        run: mypy src/
+
+      - name: Unit tests
+        run: pytest tests/unit/ -v --tb=short
+
+      - name: Lint OpenAPI spec
+        run: |
+          pip install openapi-spec-validator
+          openapi-spec-validator api/openapi.yaml
+
+  # ---------------------------------------------------------------------------
+  # JOB 2 — Build & Push Image
+  # Only runs on push to main (code change), not on manual model promotion
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'push'
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      image_uri: ${{ steps.meta.outputs.image_uri }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate image tag
+        id: meta
+        run: |
+          SHA7=$(echo ${{ github.sha }} | cut -c1-7)
+          DATE=$(date +%Y%m%d)
+          IMAGE_TAG="${SHA7}-${DATE}"
+          IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}"
+          echo "image_tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            -f container/Dockerfile \
+            -t ${{ steps.meta.outputs.image_uri }} \
+            .
+
+      # Security scan — blocks on CRITICAL CVEs before push
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image_uri }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL
+          ignore-unfixed: true
+
+      - name: Push image to ECR
+        run: docker push ${{ steps.meta.outputs.image_uri }}
+
+  # ---------------------------------------------------------------------------
+  # JOB 3 — Deploy to Staging
+  # Runs after build (code push) or directly (manual model promotion)
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [lint-and-test, build-and-push]
+    if: |
+      always() &&
+      needs.lint-and-test.result == 'success' &&
+      (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped')
+    environment:
+      name: staging
+      url: https://api-staging.company.com/v1/health
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch model artifact URI from MLflow
+        id: mlflow
+        run: |
+          PIPELINE_VERSION="${{ github.event.inputs.pipeline_version || 'latest-champion' }}"
+
+          # Fetch retrieval and ranker S3 URIs from MLflow registry
+          RETRIEVAL_URI=$(python scripts/mlflow_fetch_artifact.py \
+            --pipeline-version "${PIPELINE_VERSION}" \
+            --model retrieval)
+          RANKER_URI=$(python scripts/mlflow_fetch_artifact.py \
+            --pipeline-version "${PIPELINE_VERSION}" \
+            --model ranker)
+
+          echo "retrieval_uri=${RETRIEVAL_URI}" >> $GITHUB_OUTPUT
+          echo "ranker_uri=${RANKER_URI}" >> $GITHUB_OUTPUT
+          echo "pipeline_version=${PIPELINE_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Resolve image tag
+        id: image
+        run: |
+          # On code push: use newly built image
+          # On manual model promotion: reuse the serving_image from MLflow registry
+          if [ "${{ github.event_name }}" == "push" ]; then
+            IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
+          else
+            IMAGE_URI=$(python scripts/mlflow_fetch_serving_image.py \
+              --pipeline-version "${{ github.event.inputs.pipeline_version }}")
+          fi
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+
+      - name: Update EKS kubeconfig
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }}-staging --region ${{ env.AWS_REGION }}
+
+      - name: Deploy to staging (rolling update)
+        run: |
+          kubectl set env deployment/recommender-service \
+            -n recommender-staging \
+            MODEL_VERSION="${{ steps.mlflow.outputs.pipeline_version }}" \
+            MODEL_S3_PATH_RETRIEVAL="${{ steps.mlflow.outputs.retrieval_uri }}" \
+            MODEL_S3_PATH_RANKER="${{ steps.mlflow.outputs.ranker_uri }}"
+
+          kubectl set image deployment/recommender-service \
+            -n recommender-staging \
+            recommender="${{ steps.image.outputs.image_uri }}"
+
+          kubectl rollout status deployment/recommender-service \
+            -n recommender-staging \
+            --timeout=300s
+
+      - name: Run smoke tests against staging
+        run: |
+          pip install pytest httpx
+          pytest tests/smoke/ \
+            --base-url=https://api-staging.company.com \
+            --timeout=30 \
+            -v
+
+  # ---------------------------------------------------------------------------
+  # JOB 4 — Load Test Gate (staging only, on manual promotion)
+  # Runs Scenario 1 (steady-state) from load-test-plan.md
+  # Must pass before production deploy is allowed
+  # ---------------------------------------------------------------------------
+  load-test-gate:
+    name: Load Test Gate (Staging)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install k6
+        run: |
+          curl https://github.com/grafana/k6/releases/download/v0.50.0/k6-v0.50.0-linux-amd64.tar.gz \
+            -L -o k6.tar.gz
+          tar -xzf k6.tar.gz
+          sudo mv k6-v0.50.0-linux-amd64/k6 /usr/local/bin/
+
+      - name: Run steady-state load test (800 RPS, 10 min)
+        env:
+          LOAD_TEST_TOKEN: ${{ secrets.LOAD_TEST_TOKEN }}
+        run: |
+          k6 run \
+            --env BASE_URL=https://api-staging.company.com \
+            --env LOAD_TEST_TOKEN=${{ env.LOAD_TEST_TOKEN }} \
+            --out json=load-test-results.json \
+            serving/load-test-plan.js
+
+      - name: Upload load test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-results
+          path: load-test-results.json
+
+  # ---------------------------------------------------------------------------
+  # JOB 5 — Deploy to Production
+  # Gated by: staging success + load test pass (manual promotion only)
+  # Requires GitHub environment protection rules: manual approval
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, load-test-gate]
+    if: |
+      always() &&
+      needs.deploy-staging.result == 'success' &&
+      (needs.load-test-gate.result == 'success' || needs.load-test-gate.result == 'skipped') &&
+      (github.event.inputs.environment == 'production' || github.event_name == 'push')
+    environment:
+      name: production
+      url: https://api.company.com/v1/health
+    # ⚠️ GitHub environment protection rule required:
+    # Settings → Environments → production → Required reviewers: ml-engineer + platform-engineer
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Fetch model artifact URI from MLflow
+        id: mlflow
+        run: |
+          PIPELINE_VERSION="${{ github.event.inputs.pipeline_version || 'latest-champion' }}"
+          RETRIEVAL_URI=$(python scripts/mlflow_fetch_artifact.py \
+            --pipeline-version "${PIPELINE_VERSION}" --model retrieval)
+          RANKER_URI=$(python scripts/mlflow_fetch_artifact.py \
+            --pipeline-version "${PIPELINE_VERSION}" --model ranker)
+          echo "retrieval_uri=${RETRIEVAL_URI}" >> $GITHUB_OUTPUT
+          echo "ranker_uri=${RANKER_URI}" >> $GITHUB_OUTPUT
+          echo "pipeline_version=${PIPELINE_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Resolve image tag
+        id: image
+        run: |
+          if [ "${{ github.event_name }}" == "push" ]; then
+            IMAGE_URI="${{ needs.build-and-push.outputs.image_uri }}"
+          else
+            IMAGE_URI=$(python scripts/mlflow_fetch_serving_image.py \
+              --pipeline-version "${{ github.event.inputs.pipeline_version }}")
+          fi
+          echo "image_uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+
+      - name: Update EKS kubeconfig (production)
+        run: aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+
+      # Canary deploy: 5% traffic to new pods for 30 minutes
+      # Matches load-test-plan.md Scenario 2 and capacity-plan.md canary description
+      - name: Deploy canary (5% traffic)
+        run: |
+          kubectl set env deployment/recommender-service-canary \
+            -n recommender-prod \
+            MODEL_VERSION="${{ steps.mlflow.outputs.pipeline_version }}" \
+            MODEL_S3_PATH_RETRIEVAL="${{ steps.mlflow.outputs.retrieval_uri }}" \
+            MODEL_S3_PATH_RANKER="${{ steps.mlflow.outputs.ranker_uri }}"
+
+          kubectl set image deployment/recommender-service-canary \
+            -n recommender-prod \
+            recommender="${{ steps.image.outputs.image_uri }}"
+
+          kubectl rollout status deployment/recommender-service-canary \
+            -n recommender-prod \
+            --timeout=300s
+
+      - name: Wait for canary observation window (30 min)
+        run: sleep 1800
+
+      - name: Check canary health
+        id: canary_check
+        run: |
+          # Query Prometheus for canary error rate and p95 latency
+          ERROR_RATE=$(python scripts/prometheus_query.py \
+            --query 'sum(rate(http_requests_total{service="recommender-api",deployment="canary",status=~"5.."}[5m])) / sum(rate(http_requests_total{service="recommender-api",deployment="canary"}[5m]))')
+          P95_MS=$(python scripts/prometheus_query.py \
+            --query 'histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service="recommender-api",deployment="canary"}[5m])) by (le)) * 1000')
+
+          echo "Canary error rate: ${ERROR_RATE}"
+          echo "Canary p95 latency: ${P95_MS} ms"
+
+          # Gate: error rate < 0.5% AND p95 < 120ms
+          # Thresholds match slos.yaml and rollback.md trigger conditions
+          python -c "
+          error = float('${ERROR_RATE}')
+          p95 = float('${P95_MS}')
+          assert error < 0.005, f'Canary error rate {error:.3%} exceeds 0.5% threshold'
+          assert p95 < 120, f'Canary p95 {p95:.1f} ms exceeds 120 ms SLO'
+          print('Canary health check passed')
+          "
+
+      - name: Rollback canary on failure
+        if: failure() && steps.canary_check.outcome == 'failure'
+        run: |
+          echo "Canary health check failed — rolling back canary deployment"
+          kubectl rollout undo deployment/recommender-service-canary -n recommender-prod
+          exit 1
+
+      - name: Full production rollout
+        run: |
+          kubectl set env deployment/recommender-service \
+            -n recommender-prod \
+            MODEL_VERSION="${{ steps.mlflow.outputs.pipeline_version }}" \
+            MODEL_S3_PATH_RETRIEVAL="${{ steps.mlflow.outputs.retrieval_uri }}" \
+            MODEL_S3_PATH_RANKER="${{ steps.mlflow.outputs.ranker_uri }}"
+
+          kubectl set image deployment/recommender-service \
+            -n recommender-prod \
+            recommender="${{ steps.image.outputs.image_uri }}"
+
+          kubectl rollout status deployment/recommender-service \
+            -n recommender-prod \
+            --timeout=600s
+
+      - name: Archive previous model version in MLflow
+        run: |
+          python scripts/mlflow_archive_previous.py \
+            --current-pipeline-version "${{ steps.mlflow.outputs.pipeline_version }}"
+
+      - name: Notify deployment success
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK_URL }} \
+            -H 'Content-type: application/json' \
+            -d '{
+              "text": "✅ Recommender pipeline *${{ steps.mlflow.outputs.pipeline_version }}* deployed to production successfully.",
+              "channel": "#ml-deploys"
+            }'

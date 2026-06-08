@@ -1,0 +1,675 @@
+openapi: "3.1.0"
+
+info:
+  title: Recommender API
+  version: "1.0.0"
+  description: |
+    Personalized product recommendation service for the retail mobile app.
+    Scenario X — 800 RPS peak, p95 ≤ 120 ms end-to-end.
+    Internal endpoint. Accessible only within cluster network (not exposed via API Gateway).
+    BearerAuth not required from Prometheus — network-level restriction applies.
+
+    ## Endpoints
+    | Endpoint | Type | Use case |
+    |---|---|---|
+    | `POST /v1/recommend` | Sync | Home-screen load, real-time |
+    | `POST /v1/recommend/batch` | Async | Pre-fetch, email campaigns |
+    | `GET /v1/recommend/batch/{job_id}` | Async poll | Retrieve batch results |
+    | `GET /v1/health` | Sync | Liveness + readiness |
+    | `GET /v1/metrics/model` | Sync | Model version + drift signal |
+
+  contact:
+    name: Platform Engineering
+    email: platform-oncall@company.com
+
+servers:
+  - url: https://api.company.com
+    description: Production
+  - url: https://api-staging.company.com
+    description: Staging
+
+# ---------------------------------------------------------------------------
+# Security
+# ---------------------------------------------------------------------------
+security:
+  - BearerAuth: []
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  # -------------------------------------------------------------------------
+  # Reusable schemas
+  # -------------------------------------------------------------------------
+  schemas:
+
+    RecommendRequest:
+      type: object
+      required: [user_id, context]
+      properties:
+        user_id:
+          type: string
+          description: Stable user identifier. Must be non-PII (internal UUID).
+          example: "usr_01HZ3K8P2NQW4V6RYJCTXB5A"
+        context:
+          $ref: "#/components/schemas/RequestContext"
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 20
+          description: Maximum number of recommendations to return.
+        filters:
+          $ref: "#/components/schemas/RecommendFilters"
+
+    RequestContext:
+      type: object
+      required: [platform, screen]
+      properties:
+        platform:
+          type: string
+          enum: [ios, android, web]
+        screen:
+          type: string
+          enum: [home, category, pdp, cart]
+          description: Screen from which the request originates.
+        locale:
+          type: string
+          example: "az-AZ"
+        session_id:
+          type: string
+          description: Client session ID used for A/B cohort assignment.
+          example: "sess_7fKp2mXqRt"
+
+    RecommendFilters:
+      type: object
+      properties:
+        category_ids:
+          type: array
+          items:
+            type: string
+          description: Restrict recommendations to these category IDs.
+          example: ["cat_electronics", "cat_accessories"]
+        exclude_item_ids:
+          type: array
+          items:
+            type: string
+          description: Item IDs to exclude (e.g. already purchased).
+          example: ["item_00123", "item_00456"]
+
+    RecommendResponse:
+      type: object
+      required: [request_id, recommendations, cold_start, model_pipeline_version]
+      properties:
+        request_id:
+          type: string
+          description: Unique request identifier for tracing.
+          example: "req_01HZ3KBVQ2M7X9WNPD4YFCGE"
+        recommendations:
+          type: array
+          items:
+            $ref: "#/components/schemas/RecommendedItem"
+          minItems: 0
+          maxItems: 50
+        cold_start:
+          type: boolean
+          description: >
+            True if the response was served from the cold-start fallback
+            (DynamoDB popularity list) rather than the ML model.
+        model_pipeline_version:
+          type: string
+          description: Pipeline version bundle that produced this response. Matches X-Model-Version header.
+          example: "1.4.0"
+        ab_cohort:
+          type: string
+          description: A/B cohort assigned to this user for this request.
+          example: "challenger-1.5.0"
+          nullable: true
+
+    RecommendedItem:
+      type: object
+      required: [item_id, score, rank]
+      properties:
+        item_id:
+          type: string
+          example: "item_00789"
+        score:
+          type: number
+          format: float
+          minimum: 0.0
+          maximum: 1.0
+          description: Relevance score from the ranker model (higher = more relevant).
+          example: 0.91
+        rank:
+          type: integer
+          minimum: 1
+          description: Position in the ranked list (1 = most relevant).
+          example: 1
+        category_id:
+          type: string
+          example: "cat_electronics"
+
+    # ------------------------------------------------------------------
+    # Batch schemas
+    # ------------------------------------------------------------------
+    BatchRecommendRequest:
+      type: object
+      required: [requests]
+      properties:
+        requests:
+          type: array
+          items:
+            $ref: "#/components/schemas/RecommendRequest"
+          minItems: 1
+          maxItems: 1000
+          description: Up to 1,000 recommendation requests in a single batch job.
+        callback_url:
+          type: string
+          format: uri
+          description: Optional webhook URL. POSTed with results when job completes.
+          example: "https://internal.company.com/webhooks/recommendations"
+        priority:
+          type: string
+          enum: [normal, low]
+          default: normal
+
+    BatchJobAccepted:
+      type: object
+      required: [job_id, status, estimated_completion_seconds]
+      properties:
+        job_id:
+          type: string
+          example: "job_01HZ3KCFP8R5V2XQNM9WDBTJ"
+        status:
+          type: string
+          enum: [queued, processing, completed, failed]
+          example: queued
+        estimated_completion_seconds:
+          type: integer
+          example: 30
+        poll_url:
+          type: string
+          example: "/v1/recommend/batch/job_01HZ3KCFP8R5V2XQNM9WDBTJ"
+
+    BatchJobResult:
+      type: object
+      required: [job_id, status]
+      properties:
+        job_id:
+          type: string
+          example: "job_01HZ3KCFP8R5V2XQNM9WDBTJ"
+        status:
+          type: string
+          enum: [queued, processing, completed, failed]
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/RecommendResponse"
+          description: Present only when status = completed.
+        failed_count:
+          type: integer
+          description: Number of individual requests that failed within the batch.
+          example: 0
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    # ------------------------------------------------------------------
+    # Health schemas
+    # ------------------------------------------------------------------
+    HealthResponse:
+      type: object
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        checks:
+          type: object
+          properties:
+            redis:
+              $ref: "#/components/schemas/HealthCheck"
+            triton:
+              $ref: "#/components/schemas/HealthCheck"
+            feature_api:
+              $ref: "#/components/schemas/HealthCheck"
+        model_pipeline_version:
+          type: string
+          example: "1.4.0"
+
+    HealthCheck:
+      type: object
+      required: [status, latency_ms]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, down]
+        latency_ms:
+          type: integer
+          example: 3
+
+    # ------------------------------------------------------------------
+    # Model metrics schema
+    # ------------------------------------------------------------------
+    ModelMetricsResponse:
+      type: object
+      properties:
+        champion_pipeline_version:
+          type: string
+          example: "1.4.0"
+        challenger_pipeline_version:
+          type: string
+          nullable: true
+          example: "1.5.0-challenger"
+        ab_split_ratio:
+          type: string
+          example: "50:50"
+        feature_freshness_hours:
+          type: number
+          description: Hours since last Spark feature pipeline run wrote to Redis.
+          example: 2.1
+        cold_start_rate_1h:
+          type: number
+          description: Fraction of requests served by cold-start fallback in last 1 hour.
+          example: 0.12
+        drift_psi_latest:
+          type: number
+          description: Latest Population Stability Index on user embedding distribution.
+          example: 0.08
+
+    # ------------------------------------------------------------------
+    # Error schema
+    # ------------------------------------------------------------------
+    ErrorResponse:
+      type: object
+      required: [error_code, message, request_id]
+      properties:
+        error_code:
+          type: string
+          enum:
+            - INVALID_REQUEST
+            - USER_NOT_FOUND
+            - INFERENCE_TIMEOUT
+            - FEATURE_STORE_UNAVAILABLE
+            - MODEL_SERVER_UNAVAILABLE
+            - RATE_LIMITED
+            - INTERNAL_ERROR
+          example: INFERENCE_TIMEOUT
+        message:
+          type: string
+          example: "Model inference did not complete within the deadline."
+        request_id:
+          type: string
+          example: "req_01HZ3KBVQ2M7X9WNPD4YFCGE"
+        retryable:
+          type: boolean
+          description: Whether the client should retry this request.
+          example: true
+        retry_after_ms:
+          type: integer
+          nullable: true
+          description: Suggested retry delay in milliseconds. Present when retryable=true.
+          example: 200
+
+  # -------------------------------------------------------------------------
+  # Reusable headers
+  # -------------------------------------------------------------------------
+  headers:
+    X-Model-Version:
+      description: >
+        Pipeline version bundle that produced this response, set by the
+        Recommendation Service from the active MLflow registry tag.
+        Format: {semver} or {semver}-challenger.
+        Used by monitoring/alerts.yaml to detect unexpected version mismatches.
+      schema:
+        type: string
+        example: "1.4.0"
+    X-Request-ID:
+      description: Unique request identifier for distributed tracing.
+      schema:
+        type: string
+        example: "req_01HZ3KBVQ2M7X9WNPD4YFCGE"
+    X-RateLimit-Remaining:
+      description: Remaining requests in the current rate-limit window.
+      schema:
+        type: integer
+        example: 198
+
+  # -------------------------------------------------------------------------
+  # Reusable responses
+  # -------------------------------------------------------------------------
+  responses:
+    BadRequest:
+      description: Request validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error_code: INVALID_REQUEST
+            message: "max_results must be between 1 and 50."
+            request_id: "req_01HZ3KBVQ2M7X9WNPD4YFCGE"
+            retryable: false
+
+    TooManyRequests:
+      description: Per-user rate limit exceeded (200 req/s).
+      headers:
+        X-RateLimit-Remaining:
+          $ref: "#/components/headers/X-RateLimit-Remaining"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error_code: RATE_LIMITED
+            message: "Rate limit exceeded. Retry after 200 ms."
+            request_id: "req_01HZ3KBVQ2M7X9WNPD4YFCGE"
+            retryable: true
+            retry_after_ms: 200
+
+    InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error_code: INTERNAL_ERROR
+            message: "An unexpected error occurred."
+            request_id: "req_01HZ3KBVQ2M7X9WNPD4YFCGE"
+            retryable: true
+            retry_after_ms: 500
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+
+  # -------------------------------------------------------------------------
+  # POST /v1/recommend — synchronous, real-time
+  # -------------------------------------------------------------------------
+  /v1/recommend:
+    post:
+      operationId: getRecommendations
+      summary: Get personalized recommendations (sync)
+      description: |
+        Returns up to `max_results` ranked product recommendations for a single user.
+        Called on every home-screen load. p95 latency target: ≤ 120 ms.
+
+        **Cold-start behaviour:** If no feature vector exists in Redis for `user_id`,
+        the response is served from the DynamoDB popularity fallback.
+        `cold_start: true` is set in the response body and the
+        `X-Model-Version` header is set to `cold-start`.
+
+        **A/B testing:** Users are assigned to Champion or Challenger cohort based on
+        `context.session_id`. The active cohort is reflected in `ab_cohort` and
+        `X-Model-Version` response fields.
+      tags: [Recommendations]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecommendRequest"
+            example:
+              user_id: "usr_01HZ3K8P2NQW4V6RYJCTXB5A"
+              context:
+                platform: ios
+                screen: home
+                locale: "az-AZ"
+                session_id: "sess_7fKp2mXqRt"
+              max_results: 20
+      responses:
+        "200":
+          description: Recommendations returned successfully.
+          headers:
+            X-Model-Version:
+              $ref: "#/components/headers/X-Model-Version"
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecommendResponse"
+              example:
+                request_id: "req_01HZ3KBVQ2M7X9WNPD4YFCGE"
+                cold_start: false
+                model_pipeline_version: "1.4.0"
+                ab_cohort: null
+                recommendations:
+                  - item_id: "item_00789"
+                    score: 0.91
+                    rank: 1
+                    category_id: "cat_electronics"
+                  - item_id: "item_01234"
+                    score: 0.87
+                    rank: 2
+                    category_id: "cat_accessories"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "503":
+          description: Model server or feature store unavailable. Cold-start fallback also failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error_code: MODEL_SERVER_UNAVAILABLE
+                message: "Inference service is temporarily unavailable."
+                request_id: "req_01HZ3KBVQ2M7X9WNPD4YFCGE"
+                retryable: true
+                retry_after_ms: 1000
+
+  # -------------------------------------------------------------------------
+  # POST /v1/recommend/batch — async batch
+  # -------------------------------------------------------------------------
+  /v1/recommend/batch:
+    post:
+      operationId: submitBatchRecommendations
+      summary: Submit a batch recommendation job (async)
+      description: |
+        Accepts up to 1,000 recommendation requests in a single job.
+        Returns a `job_id` immediately. Poll `GET /v1/recommend/batch/{job_id}` for results,
+        or provide a `callback_url` to receive results via webhook.
+
+        Typical use cases: pre-fetching recommendations for email campaigns,
+        offline scoring for analytics.
+
+        Estimated completion: < 60 seconds for 1,000 requests.
+      tags: [Batch]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchRecommendRequest"
+            example:
+              requests:
+                - user_id: "usr_01HZ3K8P2NQW4V6RYJCTXB5A"
+                  context:
+                    platform: web
+                    screen: home
+                  max_results: 10
+                - user_id: "usr_01HZ3K9ABCDE1F2G3H4I5J6K"
+                  context:
+                    platform: android
+                    screen: home
+                  max_results: 10
+              callback_url: "https://internal.company.com/webhooks/recommendations"
+              priority: normal
+      responses:
+        "202":
+          description: Batch job accepted. Poll or await webhook for results.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchJobAccepted"
+              example:
+                job_id: "job_01HZ3KCFP8R5V2XQNM9WDBTJ"
+                status: queued
+                estimated_completion_seconds: 30
+                poll_url: "/v1/recommend/batch/job_01HZ3KCFP8R5V2XQNM9WDBTJ"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # -------------------------------------------------------------------------
+  # GET /v1/recommend/batch/{job_id} — poll batch result
+  # -------------------------------------------------------------------------
+  /v1/recommend/batch/{job_id}:
+    get:
+      operationId: getBatchJobResult
+      summary: Poll batch job result
+      description: |
+        Returns the current status and, when `status = completed`, the full results
+        of a previously submitted batch job.
+
+        Recommended polling interval: every 5 seconds.
+        Jobs expire 1 hour after completion.
+      tags: [Batch]
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+          example: "job_01HZ3KCFP8R5V2XQNM9WDBTJ"
+      responses:
+        "200":
+          description: Job status (and results if completed).
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchJobResult"
+              example:
+                job_id: "job_01HZ3KCFP8R5V2XQNM9WDBTJ"
+                status: completed
+                failed_count: 0
+                completed_at: "2026-06-07T14:32:10Z"
+                results:
+                  - request_id: "req_batch_0001"
+                    cold_start: false
+                    model_pipeline_version: "1.4.0"
+                    ab_cohort: null
+                    recommendations:
+                      - item_id: "item_00789"
+                        score: 0.91
+                        rank: 1
+                        category_id: "cat_electronics"
+        "404":
+          description: Job not found or expired.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error_code: INVALID_REQUEST
+                message: "Job not found or has expired."
+                request_id: "req_01HZ3KBVQ2M7X9WNPD4YFCGE"
+                retryable: false
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  # -------------------------------------------------------------------------
+  # GET /v1/health
+  # -------------------------------------------------------------------------
+  /v1/health:
+    get:
+      operationId: getHealth
+      summary: Service health check
+      description: |
+        Returns liveness and readiness status for all downstream dependencies.
+        Used by Kubernetes liveness and readiness probes.
+        Returns 200 if healthy or degraded (cold-start fallback active).
+        Returns 503 if unhealthy (all serving paths down).
+      tags: [Operations]
+      security: []   # no auth required for health endpoint
+      responses:
+        "200":
+          description: Service is healthy or degraded but serving.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: healthy
+                model_pipeline_version: "1.4.0"
+                checks:
+                  redis:
+                    status: ok
+                    latency_ms: 3
+                  triton:
+                    status: ok
+                    latency_ms: 8
+                  feature_api:
+                    status: ok
+                    latency_ms: 4
+        "503":
+          description: Service is unhealthy — all serving paths down.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  # -------------------------------------------------------------------------
+  # GET /v1/metrics/model
+  # -------------------------------------------------------------------------
+  /v1/metrics/model:
+    get:
+      security: []
+      operationId: getModelMetrics
+      summary: Current model version and drift signals
+      description: |
+        Returns the currently active pipeline versions, A/B split configuration,
+        feature freshness, cold-start rate, and latest drift signal.
+        Consumed by the monitoring dashboard and `monitoring/alerts.yaml`.
+        Internal endpoint. Accessible only within cluster network.
+        Not exposed via API Gateway. Network-level restriction replaces auth.
+      tags: [Operations]
+      responses:
+        "200":
+          description: Model metrics returned.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelMetricsResponse"
+              example:
+                champion_pipeline_version: "1.4.0"
+                challenger_pipeline_version: "1.5.0-challenger"
+                ab_split_ratio: "50:50"
+                feature_freshness_hours: 2.1
+                cold_start_rate_1h: 0.12
+                drift_psi_latest: 0.08
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+tags:
+  - name: Recommendations
+    description: Real-time personalized recommendation endpoints.
+  - name: Batch
+    description: Asynchronous batch recommendation jobs.
+  - name: Operations
+    description: Health, metrics, and operational endpoints.

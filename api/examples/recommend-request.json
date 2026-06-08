@@ -1,0 +1,13 @@
+{
+  "user_id": "usr_01HZ3K8P2NQW4V6RYJCTXB5A",
+  "context": {
+    "platform": "ios",
+    "screen": "home",
+    "locale": "az-AZ",
+    "session_id": "sess_7fKp2mXqRt"
+  },
+  "max_results": 20,
+  "filters": {
+    "exclude_item_ids": ["item_00123"]
+  }
+}

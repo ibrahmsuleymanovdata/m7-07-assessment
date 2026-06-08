@@ -1,0 +1,15 @@
+{
+  "request_id": "req_01HZ3KBVQ2M7X9WNPD4YFCGE",
+  "cold_start": true,
+  "model_pipeline_version": "cold-start",
+  "ab_cohort": null,
+  "recommendations": [
+    { "item_id": "item_09901", "score": 0.99, "rank": 1, "category_id": "cat_trending" },
+    { "item_id": "item_09902", "score": 0.98, "rank": 2, "category_id": "cat_trending" },
+    { "item_id": "item_09903", "score": 0.97, "rank": 3, "category_id": "cat_trending" }
+  ]
+}
+
+// Response headers:
+// X-Model-Version: cold-start
+// X-Request-ID: req_01HZ3KBVQ2M7X9WNPD4YFCGE
